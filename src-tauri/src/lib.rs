@@ -213,6 +213,11 @@ pub fn run() {
                 log::error!("Failed to initialize system tray: {}", e);
             }
 
+            // 兜底看门狗：最后一个窗口销毁后，正常应由运行时的 Destroyed →
+            // ExitRequested → ControlFlow::Exit 链路触发退出；该链路在个别
+            // 环境下会丢失，表现为窗口已关闭但进程连同托盘图标长期残留。
+            spawn_exit_watchdog(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -344,4 +349,56 @@ pub fn run() {
                 commands::telemetry::on_app_exit();
             }
         });
+}
+
+/// 主窗口存活看门狗。
+///
+/// 退出链（窗口销毁 → `WindowEvent::Destroyed` → `RunEvent::ExitRequested`
+/// → `ControlFlow::Exit` → 进程退出）在个别环境下会丢失，表现为：主窗口
+/// 已关闭、WebView2 子进程已退出，但进程连同托盘图标长期残留。这里周期性
+/// 检查主窗口的真实存活状态，连续两次确认已销毁后强制退出。
+///
+/// 「最小化到托盘」不受影响：隐藏窗口的 HWND 仍然存活，不会被判定为已销毁；
+/// 自提权、更新重启等流程要么在窗口存在时退出，要么先拉起新进程，均在
+/// 连续两次检查（间隔 3 秒）完成前结束，不会被误杀。
+fn spawn_exit_watchdog(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+        const DEAD_CHECKS_REQUIRED: u32 = 2;
+        let mut dead_checks: u32 = 0;
+
+        loop {
+            std::thread::sleep(CHECK_INTERVAL);
+
+            let dead = match app.get_webview_window("main") {
+                // tauri 已注销主窗口，但进程仍在运行且未处于退出流程
+                None => true,
+                Some(window) => {
+                    #[cfg(windows)]
+                    match window.hwnd() {
+                        // HWND 已失效 = 窗口已销毁，但退出未被触发
+                        Ok(hwnd) => !unsafe { winsafe::HWND::from_ptr(hwnd.0) }.IsWindow(),
+                        // 取不到 HWND 视为状态未知，不动作
+                        Err(_) => false,
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = window;
+                        false
+                    }
+                }
+            };
+
+            if dead {
+                dead_checks += 1;
+                if dead_checks >= DEAD_CHECKS_REQUIRED {
+                    log::warn!("main window destroyed but exit not triggered; forcing exit");
+                    app.exit(0);
+                    return;
+                }
+            } else {
+                dead_checks = 0;
+            }
+        }
+    });
 }
