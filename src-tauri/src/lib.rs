@@ -356,12 +356,26 @@ pub fn run() {
 /// 退出链（窗口销毁 → `WindowEvent::Destroyed` → `RunEvent::ExitRequested`
 /// → `ControlFlow::Exit` → 进程退出）在个别环境下会丢失，表现为：主窗口
 /// 已关闭、WebView2 子进程已退出，但进程连同托盘图标长期残留。这里周期性
-/// 检查主窗口的真实存活状态，连续两次确认已销毁后强制退出。
+/// 检查主窗口的真实存活状态，连续两次确认已销毁后，先兜底终止 agent 子
+/// 进程，再强制退出。
 ///
 /// 「最小化到托盘」不受影响：隐藏窗口的 HWND 仍然存活，不会被判定为已销毁；
 /// 自提权、更新重启等流程要么在窗口存在时退出，要么先拉起新进程，均在
 /// 连续两次检查（间隔 3 秒）完成前结束，不会被误杀。
 fn spawn_exit_watchdog(app: tauri::AppHandle) {
+    // 启动时记录主窗口的类名作为归属签名。HWND 是可复用的数值句柄，
+    // 仅凭 IsWindow 无法证明它仍属于主窗口。MXU 的主窗口是进程内唯一的
+    // tao 窗口（托盘/热键辅助窗口的类名不同），因此「类名一致且属于本
+    // 进程」即可精确判定 HWND 的归属。
+    #[cfg(windows)]
+    let main_window_class: Option<String> = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|hwnd| unsafe { winsafe::HWND::from_ptr(hwnd.0) })
+        .and_then(|h| h.GetClassName().ok());
+    #[cfg(not(windows))]
+    let main_window_class: Option<String> = None;
+
     std::thread::spawn(move || {
         const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
         const DEAD_CHECKS_REQUIRED: u32 = 2;
@@ -370,28 +384,28 @@ fn spawn_exit_watchdog(app: tauri::AppHandle) {
         loop {
             std::thread::sleep(CHECK_INTERVAL);
 
-            let dead = match app.get_webview_window("main") {
-                // tauri 已注销主窗口，但进程仍在运行且未处于退出流程
-                None => true,
-                Some(window) => {
-                    #[cfg(windows)]
-                    match window.hwnd() {
-                        // HWND 已失效 = 窗口已销毁，但退出未被触发
-                        Ok(hwnd) => !unsafe { winsafe::HWND::from_ptr(hwnd.0) }.IsWindow(),
-                        // 取不到 HWND 视为状态未知，不动作
-                        Err(_) => false,
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let _ = window;
-                        false
-                    }
-                }
-            };
+            // 查询本身也可能 panic（tauri 的窗口注册表锁中毒时，
+            // get_webview_window 内部会 panic），看门狗必须活过自己的
+            // 检查：panic 意味着注册表状态已损坏，按「疑似已销毁」计入
+            // 确认次数，仍需连续两次才动作。
+            let dead = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                main_window_is_dead(&app, main_window_class.as_deref())
+            }))
+            .unwrap_or_else(|_| {
+                log::warn!("watchdog check panicked; window registry untrustworthy");
+                true
+            });
 
             if dead {
                 dead_checks += 1;
                 if dead_checks >= DEAD_CHECKS_REQUIRED {
+                    // 先兜底终止 agent 子进程：Destroyed 处理器不保证运行过
+                    // （退出链的断点位置不确定），instances 锁中毒时常规清理
+                    // 也会被静默跳过；而 app.exit 最终走 std::process::exit，
+                    // 不会执行任何 Drop，子进程只能在这里显式终止。
+                    if let Some(state) = app.try_state::<Arc<MaaState>>() {
+                        state.force_kill_all_agent_children();
+                    }
                     log::warn!("main window destroyed but exit not triggered; forcing exit");
                     app.exit(0);
                     return;
@@ -401,4 +415,42 @@ fn spawn_exit_watchdog(app: tauri::AppHandle) {
             }
         }
     });
+}
+
+/// 检查主窗口是否已销毁：true = 确认销毁，false = 存活或状态未知（不动作）。
+#[cfg(windows)]
+fn main_window_is_dead(app: &tauri::AppHandle, main_window_class: Option<&str>) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        // tauri 已注销主窗口，但进程仍在运行且未处于退出流程
+        return true;
+    };
+    // hwnd() 取的是 tao 窗口创建时存储的值，窗口销毁后该值不会更新
+    let hwnd = match window.hwnd() {
+        Ok(hwnd) => unsafe { winsafe::HWND::from_ptr(hwnd.0) },
+        // 取不到 HWND 视为状态未知，不动作
+        Err(_) => return false,
+    };
+    if !hwnd.IsWindow() {
+        // HWND 已失效 = 窗口已销毁，但退出未被触发
+        return true;
+    }
+    // IsWindow 为真还需校验归属：这个数值句柄可能已被复用给其他窗口。
+    // 签名不符（类名不同或不在本进程）= 原窗口已销毁；类名取不到视为
+    // 状态未知，不动作。启动时未取得签名则退化为纯 IsWindow 判定。
+    match main_window_class {
+        Some(class) => match hwnd.GetClassName() {
+            Ok(current_class) => {
+                let (_, pid) = hwnd.GetWindowThreadProcessId();
+                !(current_class == class && pid == std::process::id())
+            }
+            Err(_) => false,
+        },
+        None => false,
+    }
+}
+
+/// 非 Windows 平台未观察到该问题，保持不动作（与原实现一致）。
+#[cfg(not(windows))]
+fn main_window_is_dead(_app: &tauri::AppHandle, _main_window_class: Option<&str>) -> bool {
+    false
 }

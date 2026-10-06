@@ -380,6 +380,24 @@ impl MaaState {
             }
         }
     }
+
+    /// 看门狗兜底清理：与 [`MaaState::cleanup_all_agent_children`] 目标相同，
+    /// 但锁中毒时也照常清理（std Mutex 中毒只说明此前有人持锁期间 panic，
+    /// 数据本身仍可安全访问），保证强制退出前子进程一定被终止。
+    pub fn force_kill_all_agent_children(&self) {
+        let mut instances = self
+            .instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (id, instance) in instances.iter_mut() {
+            for mut child in instance.agent_children.drain(..) {
+                log::info!("Watchdog: killing agent child process for instance: {}", id);
+                let _ = child.kill();
+                // 回收子进程，避免 *nix 上产生僵尸进程
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 /// Maa回调事件
