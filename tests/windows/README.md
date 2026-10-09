@@ -1,0 +1,26 @@
+# Windows 启动回归验证
+
+使用 PowerShell 7，先构建实际 MXU 可执行文件，再运行 `startup.ps1`。
+Release 程序默认自提权，因此验证 Release 时请使用管理员 PowerShell，避免把提权前的父进程退出误当成应用退出。
+
+```powershell
+./tests/windows/startup.ps1 -Executable /absolute/path/to/mxu.exe -Scenario creation-failure -EvidenceDirectory /absolute/path/to/evidence
+./tests/windows/startup.ps1 -Executable /absolute/path/to/mxu.exe -Scenario normal-close -EvidenceDirectory /absolute/path/to/evidence
+./tests/windows/startup.ps1 -Executable /absolute/path/to/mxu.exe -Scenario hidden-window -EvidenceDirectory /absolute/path/to/evidence
+./tests/windows/startup.ps1 -Executable /absolute/path/to/mxu.exe -Scenario minimize-to-tray -EvidenceDirectory /absolute/path/to/evidence
+```
+
+每个用例会复制可执行文件到独立的便携目录，并提供无任务的测试配置。
+`creation-failure` 仅为测试进程指定不存在的 WebView2 运行时路径，让真正的窗口创建失败；Release 框架自带的缺失运行时提示由脚本确认，然后检查应用退出且没有初始化托盘和后台服务。
+该注入方式验证失败处理路径，并不模拟某台机器出现 `0x80070057` 的具体原因。
+
+`repeated-startup.ps1` 覆盖短时间重复启动：每组从同一可执行文件和真实缓存目录启动两个实例，交替使用同时启动和间隔 350 毫秒启动。它不注入无效 API 参数，也不需要修改 Wry；检查两个实例都显示真实窗口、创建托盘，并能正常关闭。窗口创建阶段的 `MoveFocus` 失败在本地 WebView2 154.0.4258.62 上可通过此条件触发，其他环境中的失败频率可能不同。
+
+```powershell
+./tests/windows/repeated-startup.ps1 -Executable /absolute/path/to/MaaEnd.exe -EvidenceDirectory /absolute/path/to/evidence -Pairs 6
+```
+
+`normal-close` 检查正常关闭退出；`hidden-window` 检查有效隐藏窗口可保持运行；`minimize-to-tray` 使用完整前端加载配置，检查关闭后隐藏、进程继续运行、原窗口能恢复。
+最后一个用例需要包含已构建前端的 Release 程序。
+
+脚本只操作自己启动的测试 PID。失败时保留日志、结果 JSON 和超时转储；转储可能包含内存中的敏感信息，请勿直接公开上传。

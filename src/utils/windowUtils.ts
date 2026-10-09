@@ -127,8 +127,9 @@ export async function getWindowSize(): Promise<{ width: number; height: number }
 }
 
 /**
- * 显示窗口（配合 tauri.conf.json 中 visible: false 使用）
- * 窗口初始隐藏，在主题应用和窗口定位完成后调用此函数显示
+ * 显示窗口（配合 tauri.conf.json 中 visible: false、focus: false 使用）
+ * 窗口初始隐藏，在主题应用和窗口定位完成后显示，再请求焦点。
+ * WebView2 在隐藏窗口创建阶段请求焦点可能使整个 WebView 创建失败。
  */
 let windowShown = false;
 export async function showWindow(): Promise<void> {
@@ -141,6 +142,7 @@ export async function showWindow(): Promise<void> {
       await currentWindow.show();
       windowShown = true;
       log.info('窗口已显示');
+      await focusWindow();
     } catch (err) {
       log.warn('显示窗口失败:', err);
     }

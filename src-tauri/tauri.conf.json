@@ -21,7 +21,8 @@
         "minHeight": 525,
         "decorations": true,
         "shadow": true,
-        "visible": false
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

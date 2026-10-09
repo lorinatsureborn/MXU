@@ -56,6 +56,22 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            // Tauri 可能在 WebView 创建失败后仍注册逻辑窗口并执行 setup。
+            // 此时 HWND 不可用，必须先退出，避免留下托盘和后台服务。
+            #[cfg(windows)]
+            if app
+                .get_webview_window("main")
+                .and_then(|window| window.hwnd().ok())
+                .is_none()
+            {
+                log::error!(
+                    "Main WebView creation failed (pid={}); aborting startup before initializing backend services and tray",
+                    std::process::id()
+                );
+                app.handle().exit(1);
+                return Ok(());
+            }
+
             // 创建 MaaState 并注册为 Tauri 管理状态
             let maa_state = Arc::new(MaaState::default());
 
