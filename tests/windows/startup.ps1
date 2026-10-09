@@ -78,6 +78,7 @@ $mainHandle = [IntPtr]::Zero
 $closed = $false
 $hiddenAt = $null
 $trayCloseAt = $null
+$trayRestoreRequestedAt = $null
 $trayRestored = $false
 $errorDialogDismissed = $false
 $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -112,22 +113,32 @@ try {
             if ($null -eq $trayCloseAt -and $timer.Elapsed.TotalSeconds -ge 4 -and [StartupProbeWindows]::IsWindowVisible($mainHandle)) {
                 $closed = [StartupProbeWindows]::PostMessage($mainHandle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
                 $trayCloseAt = $timer.Elapsed.TotalSeconds
-            } elseif ($null -ne $trayCloseAt -and -not $trayRestored -and $timer.Elapsed.TotalSeconds -ge ($trayCloseAt + 3)) {
+            } elseif ($null -ne $trayCloseAt -and $null -eq $trayRestoreRequestedAt -and $timer.Elapsed.TotalSeconds -ge ($trayCloseAt + 3)) {
                 if ([StartupProbeWindows]::IsWindowVisible($mainHandle)) { throw 'Close with minimize-to-tray enabled must hide the main window.' }
-                $null = [StartupProbeWindows]::ShowWindow($mainHandle, 5)
+                $trayWindow = $windows.GetEnumerator() | Where-Object Value -eq 'tray_icon_app' | Select-Object -First 1
+                if ($null -eq $trayWindow) { throw 'The test process has no tray event window.' }
+                # MXU's first Windows menu item is "show"; muda 0.17.1 assigns
+                # native command IDs from 1000. Deliver its WM_COMMAND (0x111)
+                # to this test PID's tray menu subclass, exercising on_menu_event.
+                # Unlike a synthetic tray click, this does not need Explorer to
+                # report a rectangle for an icon hidden in the overflow panel.
+                if (-not [StartupProbeWindows]::PostMessage([IntPtr]::new($trayWindow.Key), 0x111, [IntPtr]::new(1000), [IntPtr]::Zero)) { throw 'Could not post the tray restore event.' }
+                $trayRestoreRequestedAt = $timer.Elapsed.TotalSeconds
+            } elseif ($null -ne $trayRestoreRequestedAt -and -not $trayRestored) {
                 $trayRestored = [StartupProbeWindows]::IsWindowVisible($mainHandle)
-                if (-not $trayRestored) { throw 'The hidden main window could not be restored.' }
-                # End only this test process through its native event loop.
-                $thread = [StartupProbeWindows]::ThreadForWindow($mainHandle)
-                $null = [StartupProbeWindows]::PostThreadMessage($thread, 0x12, [IntPtr]::Zero, [IntPtr]::Zero)
+                if ($trayRestored) {
+                    # End only this test process through its native event loop.
+                    $thread = [StartupProbeWindows]::ThreadForWindow($mainHandle)
+                    $null = [StartupProbeWindows]::PostThreadMessage($thread, 0x12, [IntPtr]::Zero, [IntPtr]::Zero)
+                } elseif ($timer.Elapsed.TotalSeconds -ge ($trayRestoreRequestedAt + 3)) {
+                    throw 'The tray restore handler did not show the hidden main window.'
+                }
             }
         }
     }
     if (-not $process.HasExited) { throw 'Application stayed alive after failed creation or a normal close.' }
     if ($Scenario -eq 'creation-failure') {
-        # tauri-runtime-wry 2.9.3 uses ControlFlow::Exit and does not propagate
-        # the requested code to the OS. Verify graceful exit with this version.
-        if ($process.ExitCode -ne 0) { throw "Startup failure did not exit gracefully; got $($process.ExitCode)." }
+        if ($process.ExitCode -ne 1) { throw "Failed startup must report exit code 1 to the OS; got $($process.ExitCode)." }
         if ($observedTray) { throw 'Failed startup initialized a tray icon.' }
         $nativeLog = Get-ChildItem -LiteralPath (Join-Path $caseDirectory 'debug') -Filter 'mxu-tauri*.log' |
             Get-Content -Raw
@@ -155,7 +166,7 @@ try {
         scenario = $Scenario; source = [IO.Path]::GetFullPath($Executable)
         sha256 = (Get-FileHash -LiteralPath $testExe -Algorithm SHA256).Hash
         pid = $process.Id; exitCode = $process.ExitCode; elapsedSeconds = $timer.Elapsed.TotalSeconds
-        observedMain = $observedMain; observedTray = $observedTray; closed = $closed; trayRestored = $trayRestored; errorDialogDismissed = $errorDialogDismissed
+        observedMain = $observedMain; observedTray = $observedTray; closed = $closed; trayRestoreEventPosted = ($null -ne $trayRestoreRequestedAt); trayRestored = $trayRestored; errorDialogDismissed = $errorDialogDismissed
         passed = ($null -eq $failure); failure = $failure; evidenceDirectory = $caseDirectory
     }
     $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $caseDirectory 'result.json') -Encoding utf8

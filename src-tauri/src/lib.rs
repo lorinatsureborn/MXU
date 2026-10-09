@@ -24,7 +24,7 @@ pub fn run() {
     #[cfg(windows)]
     commands::system::migrate_legacy_autostart();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
@@ -353,11 +353,32 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|_app_handle, event| {
-            // 退出前收尾遥测（结束 Session 与悬挂 Transaction 并 flush）
-            if matches!(event, tauri::RunEvent::Exit) {
-                commands::telemetry::on_app_exit();
-            }
-        });
+        .expect("error while building tauri application");
+
+    #[cfg(windows)]
+    let requested_exit_code = std::rc::Rc::new(std::cell::Cell::new(None));
+    #[cfg(windows)]
+    let final_exit_code = requested_exit_code.clone();
+
+    let on_event = move |_app_handle: &tauri::AppHandle, event: tauri::RunEvent| {
+        #[cfg(windows)]
+        if let tauri::RunEvent::ExitRequested { code, .. } = &event {
+            requested_exit_code.set(*code);
+        }
+
+        // 退出前收尾遥测（结束 Session 与悬挂 Transaction 并 flush）
+        if matches!(event, tauri::RunEvent::Exit) {
+            commands::telemetry::on_app_exit();
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        // tauri-runtime-wry 2.9.3 的 ControlFlow::Exit 丢失请求的退出码。
+        // 先让事件循环完成退出回调和框架清理，再向操作系统报告该退出码。
+        let runtime_exit_code = app.run_return(on_event);
+        std::process::exit(final_exit_code.get().unwrap_or(runtime_exit_code));
+    }
+    #[cfg(not(windows))]
+    app.run(on_event);
 }

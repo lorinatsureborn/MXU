@@ -67,7 +67,7 @@ for ($pair = 1; $pair -le $Pairs; $pair++) {
                 $observation.Main = $observation.Main -or ($null -ne $main)
                 $observation.Visible = $observation.Visible -or ($main -and $main.Visible)
                 $observation.Tray = $observation.Tray -or (@($windows | Where-Object Class -eq 'tray_icon_app').Count -gt 0)
-                if ($main -and $observation.Tray -and -not $observation.Closed -and $observation.Timer.Elapsed.TotalSeconds -ge 2) {
+                if ($main -and $main.Visible -and $observation.Tray -and -not $observation.Closed -and $observation.Timer.Elapsed.TotalSeconds -ge 2) {
                     $observation.Closed = [RepeatedStartupWindows]::PostMessage([IntPtr]::new($main.Handle),0x10,[IntPtr]::Zero,[IntPtr]::Zero)
                 }
                 if ($observation.Timer.Elapsed.TotalSeconds -gt 15) {
